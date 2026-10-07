@@ -3,7 +3,8 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import requests
-from datetime import datetime
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 st.set_page_config(page_title="交易計劃｜每分鐘 Telegram 監控", layout="wide")
 
@@ -142,10 +143,49 @@ if "editor_ver" not in st.session_state:
 if "plans" not in st.session_state:
     st.session_state.plans = dict(DEFAULT_PLANS)
 
+ET = ZoneInfo("America/New_York")
+SESSIONS = ["盤前", "盤中", "盤后", "夜盤"]
+FRESH_MINUTES = 5  # 超過此分鐘數沒有新成交，視為資料過期
+
+def now_et():
+    return datetime.now(ET)
+
+def et_date():
+    return now_et().strftime("%Y-%m-%d")
+
+def get_session(t=None):
+    """依美東時間判斷目前時段（未考慮美國假期）。
+    盤前 04:00-09:30｜盤中 09:30-16:00｜盤后 16:00-20:00｜
+    夜盤 20:00-04:00（週日晚 20:00 起至週五 04:00 止）｜其餘為休市。
+    """
+    t = t or now_et()
+    wd, hm = t.weekday(), t.hour * 60 + t.minute  # Mon=0 ... Sun=6
+    if 4 * 60 <= hm < 9 * 60 + 30 and wd < 5:
+        return "盤前"
+    if 9 * 60 + 30 <= hm < 16 * 60 and wd < 5:
+        return "盤中"
+    if 16 * 60 <= hm < 20 * 60 and wd < 5:
+        return "盤后"
+    # 夜盤：週日~週四 20:00 之後，或週一~週五 04:00 之前
+    if hm >= 20 * 60 and wd in (6, 0, 1, 2, 3):
+        return "夜盤"
+    if hm < 4 * 60 and wd in (0, 1, 2, 3, 4):
+        return "夜盤"
+    return "休市"
+
+def data_age_minutes(data_time):
+    """資料時間距今幾分鐘。"""
+    if data_time is None:
+        return None
+    ts = pd.Timestamp(data_time)
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    return (pd.Timestamp.now(tz="UTC") - ts.tz_convert("UTC")).total_seconds() / 60
+
 def today_key(symbol, plan):
-    # 每天重新允許一次通知；計劃入場區改了也視為新計劃，可再次通知
+    # 每天（美東日期）重新允許一次通知；計劃入場區改了也視為新計劃，可再次通知
     lo, hi = plan["entry"]
-    return f"{datetime.now().strftime('%Y-%m-%d')}_{symbol}_{lo}_{hi}_{plan['direction']}"
+    return f"{et_date()}_{symbol}_{lo}_{hi}_{plan['direction']}"
 
 def price_in_entry(price, entry):
     lo, hi = entry
@@ -168,9 +208,22 @@ def calculate_rr(entry_price, stop, targets):
 # ============================================================
 @st.cache_data(ttl=45, show_spinner=False)
 def get_latest_price(symbol):
-    df = yf.download(symbol, period="1d", interval="1m",
-                     auto_adjust=False, progress=False, prepost=False)
-    if df.empty:
+    # prepost=True：包含盤前 (04:00–09:30 ET) 與盤后 (16:00–20:00 ET)
+    # period="5d"：週末／夜間也能取得最後一筆成交價
+    df = None
+    try:
+        df = yf.Ticker(symbol).history(period="5d", interval="1m",
+                                       prepost=True, auto_adjust=False)
+    except Exception:
+        df = None
+    if df is None or df.empty:
+        try:
+            df = yf.download(symbol, period="5d", interval="1m",
+                             auto_adjust=False, progress=False, prepost=True)
+        except Exception:
+            return None, None, None
+
+    if df is None or df.empty:
         return None, None, None
 
     if isinstance(df.columns, pd.MultiIndex):
@@ -190,7 +243,7 @@ def get_latest_price(symbol):
 # ============================================================
 # Telegram 訊息
 # ============================================================
-def build_alert(symbol, price, plan, timestamp):
+def build_alert(symbol, price, plan, timestamp, session=""):
     entry_lo, entry_hi = plan["entry"]
     stop = format_stop(plan["stop"])
     targets = " / ".join(f"{x:.2f}" for x in plan["targets"])
@@ -201,7 +254,7 @@ def build_alert(symbol, price, plan, timestamp):
     return (
         f"🚨【入場區觸發】{symbol}\n\n"
         f"方向：{dir_text}\n"
-        f"現價：${price:.2f}\n"
+        f"現價：${price:.2f}（{session}）\n"
         f"入場區：${entry_lo:.2f}–${entry_hi:.2f}\n"
         f"止損：${stop}\n"
         f"目標：${targets}\n"
@@ -221,14 +274,27 @@ st.caption(
 
 with st.sidebar:
     st.header("⚙️ 監控設定")
-    auto_refresh = st.checkbox("自動每 60 秒更新", value=True)
+    auto_refresh = st.checkbox("自動每 60 秒更新（全天候）", value=True)
+
+    alert_sessions = st.multiselect(
+        "允許發送 Telegram 的時段",
+        SESSIONS,
+        default=SESSIONS,
+        help="只有在選中的時段、且價格資料是新鮮的情況下才會發送通知。",
+    )
+    allow_stale = st.checkbox(
+        f"允許用過期價格觸發（> {FRESH_MINUTES} 分鐘無新成交）",
+        value=False,
+        help="預設關閉，避免夜間／休市時用舊價格誤發通知。",
+    )
+    st.caption(f"🕒 目前美東時間：{now_et().strftime('%Y-%m-%d %H:%M')}｜時段：**{get_session()}**")
 
     if st.button("🧪 發送 Telegram 測試"):
         ok, msg = send_telegram("✅ Streamlit 股票監控 Telegram 測試成功")
         (st.success if ok else st.error)(msg)
 
     if st.button("🔄 重置今日通知狀態"):
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = et_date()
         st.session_state.triggered = {x for x in st.session_state.triggered if not x.startswith(today)}
         st.success("今日通知狀態已重置。")
 
@@ -324,12 +390,11 @@ st.dataframe(pd.DataFrame(plan_rows), use_container_width=True, hide_index=True)
 st.divider()
 st.subheader("📡 即時監控")
 
-status_placeholder = st.empty()
-
 def monitor():
     rows = []
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     current_plans = st.session_state.plans
+    session = get_session()
 
     for symbol, plan in current_plans.items():
         price, data_time, volume = get_latest_price(symbol)
@@ -344,13 +409,28 @@ def monitor():
         key = today_key(symbol, plan)
         telegram_status = "—"
 
+        age = data_age_minutes(data_time)
+        is_fresh = age is not None and age <= FRESH_MINUTES
+        if is_fresh:
+            data_note = f"✅ {age:.0f} 分鐘前"
+        elif age is not None:
+            hrs = age / 60
+            data_note = f"⚠️ 過期 {hrs:.1f} 小時" if hrs >= 1 else f"⚠️ 過期 {age:.0f} 分鐘"
+        else:
+            data_note = "—"
+
         if in_zone and key not in st.session_state.triggered:
-            ok, msg = send_telegram(build_alert(symbol, price, plan, now))
-            if ok:
-                st.session_state.triggered.add(key)
-                telegram_status = "✅ 已通知"
+            if session not in alert_sessions:
+                telegram_status = f"⏸ {session}未啟用通知"
+            elif not is_fresh and not allow_stale:
+                telegram_status = "⏸ 價格資料過期，暫不通知"
             else:
-                telegram_status = f"❌ {msg}"
+                ok, msg = send_telegram(build_alert(symbol, price, plan, now, session))
+                if ok:
+                    st.session_state.triggered.add(key)
+                    telegram_status = "✅ 已通知"
+                else:
+                    telegram_status = f"❌ {msg}"
         elif in_zone:
             telegram_status = "已通知（今日不重複）"
 
@@ -370,24 +450,27 @@ def monitor():
             "止損": format_stop(plan["stop"]),
             "目標": " / ".join(f"${x:.2f}" for x in plan["targets"]),
             "Telegram": telegram_status,
+            "時段": session,
+            "資料新鮮度": data_note,
             "資料時間": str(data_time),
         })
 
     st.session_state.last_refresh = now
-    status_placeholder.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-# 第一次立即執行
-monitor()
-st.caption(f"最後更新：{st.session_state.last_refresh}")
+def live_panel():
+    monitor()
+    st.caption(
+        f"最後更新：{st.session_state.last_refresh}｜美東 {now_et().strftime('%H:%M:%S')}"
+        f"｜時段：{get_session()}"
+    )
 
-if auto_refresh:
-    # Streamlit 新版支援 fragment run_every。
-    @st.fragment(run_every="60s")
-    def auto_monitor():
-        monitor()
-        st.caption(f"自動監控中｜最後更新：{st.session_state.last_refresh}")
+if st.button("⚡ 立即更新價格"):
+    get_latest_price.clear()  # 清除快取，強制重新抓取
 
-    auto_monitor()
+# 表格與刷新都放在同一個 fragment 內：
+# 自動更新時每 60 秒只重跑這一塊，且只畫一次（不再從 fragment 外寫入）
+st.fragment(run_every="60s" if auto_refresh else None)(live_panel)()
 
 st.divider()
 st.subheader("🧠 計算原則")
